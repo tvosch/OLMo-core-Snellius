@@ -1,0 +1,144 @@
+#!/bin/bash
+#SBATCH --job-name=olmo_core
+#SBATCH --partition=gpu_h100
+#SBATCH --time=00:30:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=18
+#SBATCH --gpus-per-node=4
+
+set -e
+# ============================================================================
+# SOFTWARE
+# ============================================================================
+module purge
+module load 2024 NCCL/2.22.3-GCCcore-13.3.0-CUDA-12.6.0
+export VENV_PATH=".venv"
+source $VENV_PATH/bin/activate
+
+# ============================================================================
+# DISTRIBUTED
+# ============================================================================
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_NODE:-2}
+
+export MASTER_ADDR=$(scontrol show hostnames | head -n 1)
+export MASTER_PORT=39591
+WORLD_SIZE=${SLURM_NTASKS:-$(( ${SLURM_GPUS_PER_NODE:-1} * ${SLURM_NNODES:-2} ))}
+
+export OLMO_SHARED_FS=1
+
+# ============================================================================
+# MODEL
+# ============================================================================
+MODEL=llama3-1B
+TOKENIZER="meta-llama/Llama-3.1-8B" # Local or HuggingFace identifier
+FSDP=1 # FSDP=0 means DDP
+
+# ============================================================================
+# DATA
+# ============================================================================
+TRAIN_DATA_PATHS="[fineweb-10BT_tokenized_chunk_0000.npy]"
+VAL_DATA_PATHS="[fineweb-10BT_tokenized_chunk_0001.npy]"
+MICRO_BATCH_SIZE=4
+SEQUENCE_LENGTH=4096
+GLOBAL_BATCH_SIZE=32
+GRADIENT_ACCUMULATION_STEPS=2
+EFFECTIVE_GLOBAL_BATCH_SIZE=$(expr $GLOBAL_BATCH_SIZE \* $GRADIENT_ACCUMULATION_STEPS \* $WORLD_SIZE \* $SEQUENCE_LENGTH)
+EFFECTIVE_MICRO_BATCH_SIZE=$(expr $MICRO_BATCH_SIZE \* $SEQUENCE_LENGTH)
+
+# Attach labels to each file
+FILE_COUNT=$(echo "$VAL_DATA_PATHS" | grep -o '[^, ]\+' | wc -l)
+if [ $FILE_COUNT -gt 0 ]; then
+    RAW_METADATA="[$(yes '{"label": "fineweb"}' | head -n $FILE_COUNT | paste -s -d,)]"
+    METADATA=$(printf %q "$RAW_METADATA")
+else
+    METADATA="[]"
+fi
+
+VAL_INTERVAL=1000
+DOWNSTREAM_INTERVAL=1000
+# ============================================================================
+# TRAINING
+# ============================================================================
+LEARNING_RATE=3e-4
+WEIGHT_DECAY=0.1
+WARMUP_STEPS=2000
+FLASH_ATTENTION=True
+COMPILE_MODEL=True
+COMPILE_OPTIMIZER=False # requires an 2^x number of nodes
+TOTAL_TOKENS=350_000_000
+HARD_STOP=10
+SAVE_INTERVAL=1000
+EPHEMERAL_SAVE_INTERVAL=500
+GPU_MAX_FLOPS=989e12
+GPU_MAX_FLOPS_INT=$(awk "BEGIN {printf \"%0.f\", $GPU_MAX_FLOPS}")
+
+if [ "$FSDP" = "1" ]; then
+    DP_CONFIG="fsdp"
+else
+    DP_CONFIG="ddp"
+fi
+
+# ============================================================================
+# WANDB
+# ============================================================================
+export WANDB_PROJECT=olmo-core-1b
+export WANDB_ENTITY=
+export WANDB_API_KEY=
+export WANDB_MODE=offline
+
+# ============================================================================
+# SAVING/CACHING
+# ============================================================================
+export SAVE_FOLDER=/scratch-shared/$USER/OLMo
+export TORCHINDUCTOR_CACHE_DIR=/scratch-shared/$USER/inductor_cache_$SLURM_NODEID_$SLURM_PROCID
+export TRITON_CACHE_DIR=/scratch-shared/$USER/triton_cache_$SLURM_PROCID
+export XDG_CACHE_HOME=/scratch-shared/$USER/triton_cache_$SLURM_PROCID
+rm -rf $TORCHINDUCTOR_CACHE_DIR $TRITON_CACHE_DIR
+mkdir -p $TORCHINDUCTOR_CACHE_DIR $TRITON_CACHE_DIR $XDG_CACHE_HOME
+
+TRAIN_SCRIPT_ARGS=(
+  "OLMo-core-$SLURM_JOBID-nnodes-$SLURM_JOB_NUM_NODES"
+  "$MODEL"
+  "$TOKENIZER"
+  "dataset.paths=$TRAIN_DATA_PATHS"
+  "dataset.sequence_length=$SEQUENCE_LENGTH"
+  "data_loader.global_batch_size=$EFFECTIVE_GLOBAL_BATCH_SIZE"
+  "train_module.rank_microbatch_size=$EFFECTIVE_MICRO_BATCH_SIZE"
+  "train_module.compile_model=$COMPILE_MODEL"
+  "train_module.optim.lr=$LEARNING_RATE"
+  "train_module.optim.weight_decay=$WEIGHT_DECAY"
+  "train_module.dp_config.name=$DP_CONFIG"
+  "trainer.hard_stop.value=$HARD_STOP"
+  "trainer.hard_stop.unit=steps"
+  "trainer.max_duration.value=$TOTAL_TOKENS"
+  "trainer.max_duration.unit=steps"
+  "trainer.work_dir=$SAVE_FOLDER"
+  "trainer.save_folder=$SAVE_FOLDER"
+  "train_module.scheduler.warmup_steps=$WARMUP_STEPS"
+  "trainer.checkpointer.work_dir=$SAVE_FOLDER"
+  "model.block.attention.use_flash=$FLASH_ATTENTION"
+  "trainer.callbacks.checkpointer.save_interval=$SAVE_INTERVAL"
+  "trainer.callbacks.checkpointer.ephemeral_save_interval=$EPHEMERAL_SAVE_INTERVAL"
+  "trainer.callbacks.speed_monitor.device_peak_flops=$GPU_MAX_FLOPS_INT"
+  "trainer.callbacks.lm_evaluator.eval_dataset.paths=$VAL_DATA_PATHS"
+  "trainer.callbacks.lm_evaluator.eval_dataset.sequence_length=$SEQUENCE_LENGTH"
+  "trainer.callbacks.lm_evaluator.eval_dataset.metadata=$METADATA"
+  "trainer.callbacks.lm_evaluator.eval_interval=$VAL_INTERVAL"
+  "trainer.callbacks.downstream_evaluator.eval_interval=$DOWNSTREAM_INTERVAL"
+)
+
+export TORCHLAUNCHER="torchrun \
+  --nproc_per_node=$SLURM_GPUS_PER_NODE \
+  --nnodes=$SLURM_NNODES \
+  --rdzv_id=$SLURM_JOBID \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+  --master_addr=$MASTER_ADDR \
+  --master_port=$MASTER_PORT \
+  train.py ${TRAIN_SCRIPT_ARGS[@]}
+"
+
+eval "$TORCHLAUNCHER"
+
+rm -rf $TORCHINDUCTOR_CACHE_DIR $TRITON_CACHE_DIR
