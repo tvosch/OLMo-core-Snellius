@@ -9,7 +9,8 @@ A few Snellius-specific pointers:
 - Temporary storage (/scratch-shared/$USER/) for model checkpointing and log saving
 - Operating system: Red Hat Enterprise Linux 9.4 (Plow)
 
-
+### Results
+OLMo-core has been tested on 256 H100s. The report can be found [here](https://wandb.ai/tvosch-snellius/64-node-run-20250331/reports/256-GPU-FSDP-Snellius-run-2025-03-31--VmlldzoxMjA2MzQ5OQ?accessToken=aet1406i44drrtehegzqwcuy73u74a71gv4c9hij88r5vt7ja3wuallixcqjn86v)
 
 ## Installation
 
