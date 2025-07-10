@@ -36,7 +36,6 @@ def load_chunked_data(metadata_path):
 
     basename = metadata["basename"]
     num_chunks = metadata["num_chunks"]
-    data_type = metadata["data_type"]
 
     output_dir = Path(metadata_path).parent
 
@@ -46,19 +45,14 @@ def load_chunked_data(metadata_path):
         input_ids_chunk = np.memmap(input_ids_path, dtype=np.uint32, mode="r")
 
         label_mask_chunk = None
-        if data_type == "instruct":
-            label_mask_path = (
-                output_dir / f"{basename}_label_mask_chunk_{chunk_idx:04d}.npy"
-            )
-            label_mask_chunk = np.memmap(label_mask_path, dtype=np.bool_, mode="r")
 
         yield input_ids_chunk, label_mask_chunk
 
 
 def main(args):
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
-    if args.eos:
-        tokenizer.eos_token_id = args.eos
+    if args.eos_token:
+        tokenizer.eos_token_id = args.eos_token
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
     basename = Path(args.input_jsonl).stem
@@ -132,7 +126,6 @@ def main(args):
     metadata = {
         "total_tokens": total_tokens,
         "num_chunks": chunk_idx + 1 if current_chunk_data or chunk_idx > 0 else 0,
-        "data_type": args.data_type,
         "max_seq_len": args.seq_len,
         "basename": basename,
         "files": created_files,
